@@ -1,0 +1,100 @@
+diff --git a/okf-go/hash.go b/okf-go/hash.go
+index 23c2c43..e96bd7d 100644
+--- a/okf-go/hash.go
++++ b/okf-go/hash.go
+@@ -23,8 +23,18 @@ import (
+ // Line endings are normalized to "\n" and trailing whitespace is trimmed so the
+ // hash is stable regardless of platform checkout settings.
+ func ConceptStructuralHash(doc ConceptDoc) string {
+-	norm := normalizeForHash(doc.Body)
+-	sum := sha256.Sum256([]byte(norm))
++	// Identity fields are connector-owned and deterministic, so a change in the
++	// underlying asset's identity must invalidate the hash even when the
++	// rendered body is unchanged.
++	var b strings.Builder
++	b.WriteString(doc.Frontmatter.Type)
++	b.WriteByte(0)
++	b.WriteString(doc.Frontmatter.Title)
++	b.WriteByte(0)
++	b.WriteString(doc.Frontmatter.Resource)
++	b.WriteByte(0)
++	b.WriteString(normalizeForHash(doc.Body))
++	sum := sha256.Sum256([]byte(b.String()))
+ 	return hex.EncodeToString(sum[:])
+ }
+ 
+@@ -72,6 +82,26 @@ func MergeConcept(existing *ConceptDoc, fresh ConceptDoc) (ConceptDoc, bool) {
+ 	// so okf-enrich correctly sees this concept as stale and re-enriches it.
+ 	merged.Frontmatter.EnrichedAgainst = existing.Frontmatter.EnrichedAgainst
+ 	merged.Frontmatter.Tags = unionTags(fresh.Frontmatter.Tags, existing.Frontmatter.Tags)
++	// Carry agent/human-owned trust, provenance and lifecycle state that a
++	// connector re-run does not regenerate. Fresh values win when present.
++	if len(merged.Frontmatter.Verified) == 0 {
++		merged.Frontmatter.Verified = existing.Frontmatter.Verified
++	}
++	if len(merged.Frontmatter.Sources) == 0 {
++		merged.Frontmatter.Sources = existing.Frontmatter.Sources
++	}
++	if merged.Frontmatter.UsageWindow == nil {
++		merged.Frontmatter.UsageWindow = existing.Frontmatter.UsageWindow
++	}
++	if merged.Frontmatter.Status == "" {
++		merged.Frontmatter.Status = existing.Frontmatter.Status
++	}
++	if merged.Frontmatter.StaleAfter == "" {
++		merged.Frontmatter.StaleAfter = existing.Frontmatter.StaleAfter
++	}
++	if len(merged.Frontmatter.Extra) == 0 {
++		merged.Frontmatter.Extra = existing.Frontmatter.Extra
++	}
+ 	merged.Body = preserveExtraSections(fresh.Body, existing.Body)
+ 	return merged, true
+ }
+diff --git a/okf-go/okf.go b/okf-go/okf.go
+index 4759685..a882d5b 100644
+--- a/okf-go/okf.go
++++ b/okf-go/okf.go
+@@ -54,7 +54,10 @@ func (vl *VerifiedList) UnmarshalYAML(node *yaml.Node) error {
+ 		*vl = []VerifiedEntry{single}
+ 		return nil
+ 	}
+-	return nil
++	if node.Kind == 0 {
++		return nil
++	}
++	return fmt.Errorf("invalid `verified`: expected a mapping or a list of mappings, got %s", node.Tag)
+ }
+ 
+ // SourceEntry represents an entry in the sources list per OKF-SPEC §5.1.
+@@ -113,6 +116,11 @@ type Frontmatter struct {
+ 	ContentHash     string           `yaml:"content_hash,omitempty" json:"content_hash,omitempty"`         // Structural hash for incremental re-produce
+ 	EnrichedAgainst string           `yaml:"enriched_against,omitempty" json:"enriched_against,omitempty"` // Structural hash description was enriched against
+ 	OKFVersion      string           `yaml:"okf_version,omitempty" json:"okf_version,omitempty"`           // OKF version targeted (permitted in root index.md)
++
++	// Extra retains producer-defined frontmatter keys this struct does not model,
++	// so a read->write round-trip preserves them (SPEC v0.2 §4.1: consumers SHOULD
++	// preserve unknown keys when round-tripping).
++	Extra map[string]interface{} `yaml:",inline" json:"-"`
+ }
+ 
+ // GetTrustTier derives the trust tier per OKF-SPEC §5.3.
+@@ -133,12 +141,14 @@ func (fm Frontmatter) IsStale(now time.Time) bool {
+ 	if fm.StaleAfter == "" {
+ 		return false
+ 	}
+-	t, err := time.Parse("2006-01-02", fm.StaleAfter)
+-	if err != nil {
+-		return false
++	if t, err := time.Parse(time.RFC3339, fm.StaleAfter); err == nil {
++		return !now.Before(t)
++	}
++	if t, err := time.Parse("2006-01-02", fm.StaleAfter); err == nil {
++		today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
++		return !today.Before(t)
+ 	}
+-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+-	return !today.Before(t)
++	return true
+ }
+ 
+ // GetEffectiveTimestamp returns generated.at if set, otherwise legacy timestamp.
